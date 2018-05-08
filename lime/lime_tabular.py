@@ -17,7 +17,10 @@ from lime.discretize import EntropyDiscretizer
 from lime.discretize import BaseDiscretizer
 from . import explanation
 from . import lime_base
-
+try:
+    from pyspark.ml.linalg import Vectors
+except ImportError:
+    Vectors = None
 
 class TableDomainMapper(explanation.DomainMapper):
     """Maps feature ids to names, generates table views, etc"""
@@ -559,6 +562,144 @@ class RecurrentTabularExplainer(LimeTabularExplainer):
         # Wrap the classifier to reshape input
         classifier_fn = self._make_predict_proba(classifier_fn)
         return super(RecurrentTabularExplainer, self).explain_instance(
+            data_row, classifier_fn,
+            labels=labels,
+            top_labels=top_labels,
+            num_features=num_features,
+            num_samples=num_samples,
+            distance_metric=distance_metric,
+            model_regressor=model_regressor)
+
+
+class SparkLimeTabularExplainer(LimeTabularExplainer):
+    """
+    Tabular explainer for PySpark ML models. This class just extends the LimeTabularExplainer class which takes
+    numpy ndarray as input. Each of these methods take PySpark Dataframes and convert it to numpy array based
+    on the `featuresCol` generated using VectorAssesmbler.
+    """
+
+    def __init__(self, training_data, sqlContext, featuresCol="features", training_labels=None,
+                 categorical_features=None, categorical_names=None,
+                 kernel_width=None, verbose=False, class_names=None,
+                 feature_selection='auto', discretize_continuous=True,
+                 discretizer='quartile', random_state=None):
+        """
+        Args:
+            training_data: PySpark Dataframe
+            sqlContext: PySpark SQLContext Instance
+            featuresCol: PySpark Dataframe features column name
+            training_labels: labels for training data. Not required, but may be
+                used by discretizer.
+            categorical_features: list of indices (ints) corresponding to the
+                categorical columns. Everything else will be considered
+                continuous. Values in these columns MUST be integers.
+            categorical_names: map from int to list of names, where
+                categorical_names[x][y] represents the name of the yth value of
+                column x.
+            kernel_width: kernel width for the exponential kernel.
+            If None, defaults to sqrt(number of columns) * 0.75
+            verbose: if true, print local prediction values from linear model
+            class_names: list of class names, ordered according to whatever the
+                classifier is using. If not present, class names will be '0',
+                '1', ...
+            feature_selection: feature selection method. can be
+                'forward_selection', 'lasso_path', 'none' or 'auto'.
+                See function 'explain_instance_with_data' in lime_base.py for
+                details on what each of the options does.
+            discretize_continuous: if True, all non-categorical features will
+                be discretized into quartiles.
+            discretizer: only matters if discretize_continuous is True. Options
+                are 'quartile', 'decile', 'entropy' or a BaseDiscretizer
+                instance.
+            random_state: an integer or numpy.RandomState that will be used to
+                generate random numbers. If None, the random state will be
+                initialized using the internal numpy seed.
+        """
+
+
+        self.featuresCol = featuresCol
+        # Converting Spark DataFrame to Numpy 2d Array
+        train_data = np.array(training_data.select(featuresCol).rdd.flatMap(list).collect(),dtype=object)
+
+        # Fetching feature names from PySpark Dataframe directly.
+        feature_names = training_data.columns
+        print train_data.shape, len(feature_names)
+        # self.df_schema = training_data.columns
+        self.df_schema = training_data.select(featuresCol).schema
+        self.sqlContext = sqlContext
+
+        # Send off the the super class to do its magic.
+        super(SparkLimeTabularExplainer, self).__init__(
+                train_data,
+                training_labels=training_labels,
+                feature_names=feature_names,
+                categorical_features=categorical_features,
+                categorical_names=categorical_names,
+                kernel_width=kernel_width, verbose=verbose,
+                class_names=class_names,
+                feature_selection=feature_selection,
+                discretize_continuous=discretize_continuous,
+                discretizer=discretizer,
+                random_state=random_state)
+
+    def _make_predict_proba(self, func, probabilityCol):
+        """
+        Convert numpy 2d to spark dataframe
+        """
+
+        def predict_proba(np_arr):
+            if Vectors is None:
+                raise ImportError('`SparkTabular` needs pyspark to be installed')
+            arr_shape = np_arr.shape
+            np_arr = np_arr.reshape(arr_shape[0],1,arr_shape[1])
+            np_arr = np.asfarray(np_arr,dtype='float').tolist()
+            densevector_arr = [map(lambda x: Vectors.dense(x), y) for y in np_arr]
+            spark_df = self.sqlContext.createDataFrame(densevector_arr,schema=self.df_schema)
+            result_df = func(spark_df)
+            # Extract probability from spark result dataframe
+            return np.array(result_df.select(probabilityCol).rdd.flatMap(list).collect())
+
+        return predict_proba
+
+    def explain_instance(self, data_row, classifier_fn, probabilityCol="probability",
+                         labels=(1,), top_labels=None, num_features=10, num_samples=5000,
+                         distance_metric='euclidean', model_regressor=None):
+        """Generates explanations for a prediction.
+
+        First, we generate neighborhood data by randomly perturbing features
+        from the instance (see __data_inverse). We then learn locally weighted
+        linear models on this neighborhood data to explain each of the classes
+        in an interpretable way (see lime_base.py).
+
+        Args:
+            data_row: PySpark Dataframe, corresponding to a row
+            classifier_fn: classifier prediction probability function, which
+                takes a PySpark Dataframe and outputs Dataframe with probability column.
+                For SparkClassifiers, this is classifier.transform.
+            probabilityCol: classifier prediction probability column in the transformed Dataframe.
+            labels: iterable with labels to be explained.
+            top_labels: if not None, ignore labels and produce explanations for
+                the K labels with highest prediction probabilities, where K is
+                this parameter.
+            num_features: maximum number of features present in explanation
+            num_samples: size of the neighborhood to learn the linear model
+            distance_metric: the distance metric to use for weights.
+            model_regressor: sklearn regressor to use in explanation. Defaults
+                to Ridge regression in LimeBase. Must have
+                model_regressor.coef_ and 'sample_weight' as a parameter
+                to model_regressor.fit()
+
+        Returns:
+            An Explanation object (see explanation.py) with the corresponding
+            explanations.
+        """
+
+        # Flatten input so that the normal explainer can handle it
+        data_row = np.array(data_row.select(self.featuresCol).head()[self.featuresCol],dtype=object)
+
+        # Wrap the classifier to reshape input
+        classifier_fn = self._make_predict_proba(classifier_fn,probabilityCol)
+        return super(SparkLimeTabularExplainer, self).explain_instance(
             data_row, classifier_fn,
             labels=labels,
             top_labels=top_labels,
